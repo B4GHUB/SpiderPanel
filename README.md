@@ -11,7 +11,7 @@
 اگر می‌خواهید SpiderPanel را مستقیماً روی VPS نصب کنید، دستور زیر را در ترمینال اجرا کنید:
 
 ```bash
-sudo curl -fsSL https://raw.githubusercontent.com/amirh00sain/SpiderPanel/main/start.sh | bash
+curl -fsSL https://raw.githubusercontent.com/amirh00sain/SpiderPanel/main/start.sh | bash
 ```
 
 > 💡 **دستور بالا را کپی کرده و در ترمینال VPS اجرا کنید.**
