@@ -489,6 +489,8 @@ BOT_CONFIG: dict = {
     "bot_token": "",
     "channel_id": "",
     "promotion_channel": "",
+    "fixed_channel": "",
+    "target_channel_link": "",
     "webhook_secret": "",
     "interval_value": 10,
     "interval_unit": "seconds",  # seconds, minutes, hours
@@ -558,6 +560,20 @@ async def require_auth(request: Request):
     if not await is_valid_session(token):
         raise HTTPException(status_code=401, detail="unauthorized")
     return token
+
+async def require_panel_or_node(request: Request):
+    """Allow the normal admin session or a registered node API key.
+
+    Node replication uses X-API-Key because remote panels do not share the
+    browser session cookie. The key is the panel API key generated in Settings.
+    """
+    token = request.cookies.get(SESSION_COOKIE)
+    if await is_valid_session(token):
+        return token
+    key = str(request.headers.get("X-API-Key") or request.query_params.get("api_key") or "").strip()
+    if key and PANEL_API_KEY and secrets.compare_digest(key, PANEL_API_KEY):
+        return key
+    raise HTTPException(status_code=401, detail="unauthorized")
 
 # ── Reality + Xray helpers ─────────────────────────────────────────────────────
 def _gen_ml_dsa65(seed: bytes) -> str:
@@ -1200,36 +1216,24 @@ async def startup():
                 "fingerprint": "chrome",
                 "reality_settings": {},
                 "xhttp_settings": {},
-                "ws_settings": {"path": "/route/{uuid}"},
+                "ws_settings": {"path": "/route/{country}/{uuid}"},
                 "grpc_settings": {},
                 "created_at": datetime.now().isoformat(),
             }
             asyncio.create_task(save_state())
             log_activity("inbound", "اینباند پیش‌فرض Worker ساخته شد", "ok")
 
-    # Auto-create a default NODE inbound (system-managed, not user-editable)
-    has_node = any((ib.get("protocol") or "").lower() == "node" for ib in INBOUNDS.values())
-    if not has_node:
-        _nd = _safe_host(SETTINGS.get("domain"), get_host())
-        INBOUNDS["default-node"] = {
-            "name": "NODE (Multi-Node Sync)",
-            "protocol": "node",
-            "port": 443,
-            "network": "ws",
-            "security": "tls",
-            "domain": _nd,
-            "external_domain": _nd,
-            "sni": "",
-            "external_port": 443,
-            "fingerprint": "chrome",
-            "reality_settings": {},
-            "xhttp_settings": {},
-            "ws_settings": {"path": "/ws/{uuid}"},
-            "grpc_settings": {},
-            "created_at": datetime.now().isoformat(),
-        }
-        asyncio.create_task(save_state())
-        log_activity("inbound", "اینباند پیش‌فرض NODE ساخته شد", "ok")
+    # NODE inbound is created lazily after the first real node is added.
+    # Clean up the legacy auto-created inbound when no nodes are registered.
+    if not NODES:
+        async with INBOUNDS_LOCK:
+            stale_node_ids = [iid for iid, ib in INBOUNDS.items()
+                              if (ib.get("protocol") or "").lower() == "node"]
+            for iid in stale_node_ids:
+                INBOUNDS.pop(iid, None)
+        if stale_node_ids:
+            asyncio.create_task(save_state())
+            log_activity("inbound", "اینباند قدیمی NODE حذف شد؛ تا ثبت اولین Node ساخته نمی‌شود", "info")
 
     # Normalize existing Telegram inbounds: only internal/external Telegram fields
     # are meaningful. Remove legacy SNI/Destination/Server Name state.
@@ -1489,6 +1493,7 @@ async def _start_telegram_proxy(inbound_id: str, inbound: dict):
         "internal_port": int_port,
         "external_port": ext_port,
         "external_domain": ext_domain,
+        "promotion_tag": str(tg.get("promotion_tag") or tg.get("promotion_channel") or "").strip(),
         "promotion_channel": str(tg.get("promotion_channel") or "").strip(),
     }
     inbound["port"] = int_port
@@ -1507,7 +1512,10 @@ async def _start_telegram_proxy(inbound_id: str, inbound: dict):
                     u["telegram_secret"] = secret
                 secrets_map[secret] = {"user_id": uid, "config_uuid": config_uuid, "label": u.get("username", uid)}
 
-    server = MTProtoProxyServer(inbound_id=inbound_id, port=int_port, promotion_tag=str(tg.get("promotion_channel") or "").strip())
+    raw_promo = str(tg.get("promotion_tag") or "").strip()
+    if not re.fullmatch(r"[0-9a-fA-F]{32}", raw_promo):
+        raw_promo = ""
+    server = MTProtoProxyServer(inbound_id=inbound_id, port=int_port, promotion_tag=raw_promo)
     server.update_secrets(secrets_map)
     if not secrets_map:
         logger.info(f"[TG Proxy {inbound_id}] no users yet; listener will start after a Telegram user is assigned")
@@ -1803,7 +1811,7 @@ def generate_user_config(user_id: str, user: dict, inbound_id: str = None, addr:
                    panel's main domain, port 443. ws is the default transport,
                    xhttp is selectable per inbound.
       - Worker   → served by the Cloudflare Worker; address/host/sni = worker
-                   domain, path /route/{country-code} (see _worker_configs).
+                   domain, path /route/{country}/{uuid} (see _worker_configs).
 
     addr (scanned custom IP) overrides only the connect address; host/sni stay
     on the real domain so the TLS handshake reaches the service.
@@ -1836,6 +1844,21 @@ def generate_user_config(user_id: str, user: dict, inbound_id: str = None, addr:
         wcfgs = _worker_configs(user_id, user, inbound, "", remark_tag, addr_ip, addr_port)
         if wcfgs:
             return wcfgs[0]
+        return ""
+
+    # ── NODE (same UUID across every registered SpiderPanel) ──
+    if proto == "node":
+        existing = [c.get("config") for c in (user.get("node_configs") or []) if c.get("config")]
+        if existing:
+            return existing[0]
+        # Immediate fallback while the async remote sync is settling.
+        try:
+            for node in NODES.values():
+                cfg = _node_config_for_user(node, config_uuid, username)
+                if cfg:
+                    return cfg
+        except Exception:
+            pass
         return ""
 
     # ── WIREGUARD / AmneziaWG ──
@@ -1907,6 +1930,17 @@ def generate_user_config(user_id: str, user: dict, inbound_id: str = None, addr:
     # ── TLS (WS default / XHTTP selectable) — served by the FastAPI relay ──
     # address/host/sni always = the panel main domain; port 443 (Railway TLS).
     panel_domain = _safe_host(SETTINGS.get("domain"), get_host())
+
+    # ── REVERSE (user → CF Worker → Railway → site) — path /reverse/{uuid} ──
+    if proto == "reverse":
+        wdom = _worker_safe_domain(WORKER.get("worker_domain"))
+        if not wdom or not WORKER.get("connected"):
+            return ""
+        rpath = f"/reverse/{config_uuid}"
+        params = ("encryption=none&security=tls&type=ws"
+                  f"&host={quote(wdom)}&path={quote(rpath, safe='')}&sni={quote(wdom)}"
+                  "&fp=chrome&alpn=http/1.1")
+        return f"vless://{config_uuid}@{wdom}:443?{params}#{quote(f'Spider-{username} Reverse')}"
 
     # ── TUNNEL (user → Railway → CF Worker → site) — path /tunnel/{uuid} ──
     if proto == "tunnel":
@@ -2181,7 +2215,7 @@ def generate_sni_spoof_configs(user_id: str, user: dict) -> list:
                 clabel = str(p.get("country") or (code.upper() if code else "Worker"))
                 rem = quote(f"Spider-{uname} {flag} {clabel} SniSpoof".strip() if flag else f"Spider-{uname} Worker SniSpoof")
 
-                wpath = f"/route/{code}" if code else "/"
+                wpath = f"/route/{code}/{cfg_uuid}" if code else "/"
                 params = "&".join([
                     f"snispoofing={spoof_q}",
                     "security=tls",
@@ -2281,7 +2315,7 @@ def _worker_configs(user_id: str, user: dict, inbound: dict, stored_path: str, b
         flag = _code_to_flag(code) if code else ""
         clabel = str(p.get("country") or (code.upper() if code else "Worker"))
         rem = quote(f"Spider-{uname} {flag} {clabel}".strip() if flag else f"Spider-{uname} Worker")
-        wpath = f"/route/{code}" if code else f"/{cfg_uuid}"
+        wpath = f"/route/{code}/{cfg_uuid}" if code else f"/{cfg_uuid}"
 
         params = {
             "encryption": "none",
@@ -3025,7 +3059,7 @@ async def _tunnel_relay(ws: WebSocket, uuid: str, worker_domain: str):
     log_activity("connection", f"Tunnel اتصال جدید از {ip}", "info")
     worker_ws = None
     try:
-        wss_url = f"wss://{worker_domain}/{uuid}"
+        wss_url = f"wss://{worker_domain}/tunnel/{uuid}"
         headers = {"User-Agent": "Spider-Tunnel"}
         worker_ws = await asyncio.wait_for(
             _websockets.connect(wss_url, extra_headers=headers, max_size=None), timeout=10.0)
@@ -3120,7 +3154,7 @@ async def create_inbound(request: Request, _=Depends(require_auth)):
     body = await request.json()
     name = (body.get("name") or "اینباند جدید").strip()[:60]
     protocol = str(body.get("protocol") or "vless").lower()
-    if protocol not in ("vless", "vmess", "trojan", "reality", "worker", "wireguard", "telegram", "node"):
+    if protocol not in ("vless", "vmess", "trojan", "reality", "worker", "tunnel", "reverse", "wireguard", "telegram", "node"):
         raise HTTPException(status_code=400, detail="Invalid protocol")
     network = str(body.get("network") or "ws").lower()
     security = str(body.get("security") or "tls").lower()
@@ -3170,6 +3204,7 @@ async def create_inbound(request: Request, _=Depends(require_auth)):
             "internal_port": int(telegram_settings.get("internal_port") or port or 44344),
             "external_port": int(telegram_settings.get("external_port") or external_port or 443),
             "external_domain": str(telegram_settings.get("external_domain") or external_domain or "").strip(),
+            "promotion_tag": str(telegram_settings.get("promotion_tag") or telegram_settings.get("promotion_channel") or "").strip(),
             "promotion_channel": str(telegram_settings.get("promotion_channel") or "").strip(),
         }
         port = telegram_settings["internal_port"]
@@ -3285,11 +3320,13 @@ async def update_inbound(inbound_id: str, request: Request, _=Depends(require_au
         ib = INBOUNDS.get(inbound_id)
         if not ib:
             raise HTTPException(status_code=404, detail="inbound not found")
+        if (ib.get("system_managed") or (ib.get("protocol") or "").lower() in ("node", "worker", "tunnel", "reverse")):
+            raise HTTPException(status_code=403, detail="اینباند سیستمی است و قابل ویرایش نیست")
         if "name" in body:
             ib["name"] = str(body["name"]).strip()[:60]
         if "protocol" in body:
             p = str(body["protocol"]).lower()
-            if p in ("vless", "vmess", "trojan", "reality", "worker", "wireguard", "telegram"):
+            if p in ("vless", "vmess", "trojan", "reality", "worker", "tunnel", "reverse", "wireguard", "telegram"):
                 ib["protocol"] = p
         # A worker inbound always targets the connected worker domain; if the
         # inbound's domain is stale/empty, refresh it automatically.
@@ -3413,6 +3450,7 @@ async def update_inbound(inbound_id: str, request: Request, _=Depends(require_au
             tg["internal_port"] = int(incoming_tg.get("internal_port") or body.get("port") or tg.get("internal_port") or ib.get("port") or 44344)
             tg["external_port"] = int(incoming_tg.get("external_port") or body.get("external_port") or tg.get("external_port") or ib.get("external_port") or 443)
             tg["external_domain"] = str(incoming_tg.get("external_domain") or body.get("external_domain") or tg.get("external_domain") or ib.get("external_domain") or "").strip()
+            tg["promotion_tag"] = str(incoming_tg.get("promotion_tag") or tg.get("promotion_tag") or incoming_tg.get("promotion_channel") or "").strip()
             tg["promotion_channel"] = str(incoming_tg.get("promotion_channel") or tg.get("promotion_channel") or "").strip()
             ib.pop("sni", None)
             ib.pop("destination", None)
@@ -3574,7 +3612,7 @@ def _random_username() -> str:
 
 
 @app.post("/api/users")
-async def create_user(request: Request, _=Depends(require_auth)):
+async def create_user(request: Request, _=Depends(require_panel_or_node)):
     """Create a new user with protocol config, traffic limit, and expiry."""
     body = await request.json()
     username = str(body.get("username") or "").strip()[:40]
@@ -3605,12 +3643,12 @@ async def create_user(request: Request, _=Depends(require_auth)):
     proxy_country = str(body.get("proxy_country") or "").strip()
     proxy_ips = [str(x).strip() for x in (body.get("proxy_ips") or []) if str(x).strip()][:3]
     # Worker multi-location: the user may pick one or more countries; each gets
-    # its own /route/{code} config. Only set for worker inbounds.
+    # its own /route/{country}/{uuid} config. Only set for worker inbounds.
     proxy_countries = [str(x).strip().lower() for x in (body.get("proxy_countries") or []) if str(x).strip()]
     if not proxy_countries and proxy_country:
         proxy_countries = [proxy_country.lower()]
     # Cloudflare Worker routing: when enabled + worker connected, the user's
-    # configs are addressed to the worker domain with a /route/{code} path.
+    # configs are addressed to the worker domain with a /route/{country}/{uuid} path.
     proxy_ip_enabled = bool(body.get("proxy_ip_enabled"))
     if proxy_ip_enabled and not WORKER.get("connected"):
         proxy_ip_enabled = False
@@ -3659,7 +3697,8 @@ async def create_user(request: Request, _=Depends(require_auth)):
         concurrent_connections = 0
 
     user_id = generate_short_id()
-    config_uuid = generate_uuid()
+    supplied_uuid = str(body.get("config_uuid") or "").strip()
+    config_uuid = supplied_uuid if _is_valid_uuid(supplied_uuid) else generate_uuid()
     subscription_uuid = secrets.token_urlsafe(16)
     traffic_limit_bytes = int(traffic_limit_gb * 1024 ** 3) if traffic_limit_gb > 0 else 0
     expire_at = (datetime.now() + timedelta(days=expire_days)).isoformat() if expire_days > 0 else None
@@ -3701,15 +3740,19 @@ async def create_user(request: Request, _=Depends(require_auth)):
                 raise HTTPException(status_code=500, detail="Could not generate a unique username")
 
         # Determine the path based on the inbound type, not just transport_type
-        # WS inbound -> /ws/{config_uuid}, XHTTP inbound -> /xhttp-siz10/..., Worker inbound -> /route/...
+        # WS inbound -> /ws/{config_uuid}, XHTTP inbound -> /xhttp-siz10/..., Worker inbound -> /route/{country}/{uuid}
         primary_inbound = INBOUNDS.get(inbound_id) if inbound_id else None
         primary_inbound_proto = (primary_inbound.get("protocol") if primary_inbound else "").lower()
         primary_inbound_network = (primary_inbound.get("network") if primary_inbound else "").lower()
 
         if primary_inbound_proto == "worker":
-            # Worker inbound uses /route/{code} path
-            # For worker, we use a placeholder; actual path is /route/{country} per country
-            path = f"/route/{config_uuid}"
+            # Country is part of the Worker route; actual per-country links
+            # are emitted by _worker_configs(). Keep a deterministic template.
+            path = f"/route/{{country}}/{config_uuid}"
+        elif primary_inbound_proto == "tunnel":
+            path = f"/tunnel/{config_uuid}"
+        elif primary_inbound_proto == "reverse":
+            path = f"/reverse/{config_uuid}"
         elif primary_inbound_proto == "node":
             # NODE inbound: user is replicated to all nodes with the same UUID.
             path = f"/ws/{config_uuid}"
@@ -3766,6 +3809,10 @@ async def create_user(request: Request, _=Depends(require_auth)):
             link_protocol = "reality"
         elif transport_type == "worker":
             link_protocol = "worker"
+        elif transport_type == "tunnel":
+            link_protocol = "tunnel"
+        elif transport_type == "reverse":
+            link_protocol = "reverse"
 
         if transport_type == "xhttp":
             link_xhttp = {
@@ -3829,6 +3876,7 @@ async def create_user(request: Request, _=Depends(require_auth)):
     node_results = []
     if primary_inbound_proto == "node":
         node_results = await _create_user_on_nodes(config_uuid, {"username": username})
+        await _refresh_node_user_configs([user_id])
     return {
         "user_id": user_id,
         **USERS[user_id],
@@ -3980,7 +4028,7 @@ async def get_user(user_id: str, _=Depends(require_auth)):
 
 
 @app.delete("/api/users/{user_id}")
-async def delete_user(user_id: str, _=Depends(require_auth)):
+async def delete_user(user_id: str, _=Depends(require_panel_or_node)):
     """Delete a user permanently."""
     async with USERS_LOCK:
         u = USERS.get(user_id)
@@ -4349,6 +4397,8 @@ async def api_user_sub(username: str):
                     configs.append(generate_user_config(uid_, user, iid_))
             except Exception:
                 continue
+    if user.get("node_configs"):
+        configs.extend(c.get("config") for c in user.get("node_configs") if c.get("config"))
     if not configs:
         # Fallback: single inbound config
         fallback_config = generate_user_config(user.get("user_id"), user, user.get("inbound_id"))
@@ -6751,6 +6801,13 @@ def _worker_public() -> dict:
         "tunnel_kv_namespace_title": WORKER.get("tunnel_kv_namespace_title", ""),
         "reverse_kv_namespace_id": WORKER.get("reverse_kv_namespace_id", ""),
         "reverse_kv_namespace_title": WORKER.get("reverse_kv_namespace_title", ""),
+        "fixed_inbounds": [
+            {"id": iid, "name": ib.get("name", iid), "protocol": ib.get("protocol", ""),
+             "domain": ib.get("domain", ""), "path": (ib.get("ws_settings") or {}).get("path", ""),
+             "system_managed": bool(ib.get("system_managed"))}
+            for iid, ib in INBOUNDS.items()
+            if (ib.get("protocol") or "").lower() in ("worker", "tunnel", "reverse")
+        ],
         "proxies": [
             {"code": code, **dict(p)}
             for code, p in sorted((WORKER.get("proxies") or {}).items())
@@ -6976,74 +7033,59 @@ async def _worker_enable_workers_dev() -> dict:
 
 
 async def _worker_sync_users() -> dict:
-    """Push all panel users (with volume + expiry) to the worker's KV store.
-
-    Each active panel user who picked the worker inbound is written to the
-    worker via its admin API (POST /api/users) so the VLESS worker can
-    authenticate them and enforce traffic/expiry. Returns {"ok": bool, count": N}.
-    """
+    """Synchronize users to the correct isolated Worker KV namespaces."""
     domain = str(WORKER.get("worker_domain") or "").strip().lower()
     ctrl = str(WORKER.get("control_token") or "")
     if not domain or not ctrl or domain in ("localhost", "0.0.0.0", "127.0.0.1"):
         return {"ok": False, "detail": "worker not connected / no control token"}
-    # Only users that reference the worker or tunnel inbound are synced — both
-    # terminate on the Worker (worker: /route/{code}, tunnel/reverse: the
-    # Railway hop authenticates via /tunnel/{uuid} against the same KV).
-    sync_inbounds = {iid for iid, ib in INBOUNDS.items()
-                     if ((ib or {}).get("protocol") or "").lower() in ("worker", "tunnel")}
-    if not sync_inbounds:
-        return {"ok": False, "detail": "no worker inbound"}
-    synced = 0
+    counts = {"worker": 0, "tunnel": 0, "reverse": 0}
+    async with USERS_LOCK:
+        users_snap = [(uid, dict(u)) for uid, u in USERS.items()]
+    async with INBOUNDS_LOCK:
+        ib_snap = dict(INBOUNDS)
+
     async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
-        for uid, u in USERS.items():
+        for uid, u in users_snap:
             iids = u.get("inbound_ids") or ([u.get("inbound_id")] if u.get("inbound_id") else [])
-            if not (set(iids) & sync_inbounds):
+            scopes = set()
+            for iid in iids:
+                proto = ((ib_snap.get(iid) or {}).get("protocol") or "").lower()
+                if proto == "worker": scopes.add("worker")
+                elif proto == "tunnel":
+                    scopes.add("tunnel")
+                elif proto == "reverse":
+                    scopes.add("reverse")
+            if not scopes:
                 continue
             cuuid = u.get("config_uuid") or uid
             deadline = 0
             if u.get("expire_at"):
+                try: deadline = int(datetime.fromisoformat(u["expire_at"]).timestamp())
+                except Exception: deadline = 0
+            payload = {
+                "uuid": cuuid,
+                "remark": u.get("username", uid),
+                "limit_bytes": int(u.get("traffic_limit_bytes") or 0),
+                "expire": deadline,
+                "used_bytes": int(u.get("traffic_used_bytes") or 0),
+                "proxy_ip": str(u.get("proxy_ip") or ""),
+                "concurrent_connections": int(u.get("concurrent_connections") or 0),
+                "countries": list(u.get("proxy_countries") or ([u.get("proxy_country")] if u.get("proxy_country") else [])),
+            }
+            for scope in sorted(scopes):
                 try:
-                    deadline = int(datetime.fromisoformat(u["expire_at"]).timestamp())
-                except Exception:
-                    deadline = 0
-            limit = int(u.get("traffic_limit_bytes") or 0)
-            disabled = (u.get("status") or "active") != "active"
-            try:
-                if disabled:
-                    # Disabled user → drop from the worker so it stops authenticating.
-                    r = await client.delete(
-                        f"https://{domain}/api/user/{cuuid}",
-                        headers={"Authorization": f"Bearer {ctrl}"},
-                    )
-                else:
-                    r = await client.post(
-                        f"https://{domain}/api/users",
-                        headers={"Authorization": f"Bearer {ctrl}"},
-                        json={
-                            "uuid": cuuid,
-                            "remark": u.get("username", uid),
-                            "limit_bytes": limit,
-                            "expire": deadline,
-                            "used_bytes": int(u.get("traffic_used_bytes") or 0),
-                            "proxy_ip": "",
-                            "concurrent_connections": int(u.get("concurrent_connections") or 0),
-                            "countries": list(u.get("proxy_countries") or ([u.get("proxy_country")] if u.get("proxy_country") else [])),
-                        },
-                    )
-                if r.status_code in (200, 204):
-                    if r.status_code == 200:
-                        try:
-                            payload = r.json().get("user") or {}
-                            if payload.get("configs") is not None:
-                                u["worker_configs"] = payload.get("configs") or []
-                            if payload.get("used_bytes") is not None:
-                                u["traffic_used_bytes"] = int(payload.get("used_bytes") or 0)
-                        except Exception:
-                            pass
-                    synced += 1
-            except Exception as e:
-                logger.warning(f"worker user sync failed for {uid}: {e}")
-    return {"ok": True, "count": synced}
+                    target = "/api/users" if scope == "worker" else f"/api/{scope}/users"
+                    headers = {"Authorization": f"Bearer {ctrl}"}
+                    if (u.get("status") or "active") != "active":
+                        r = await client.delete(f"https://{domain}{target}/{cuuid}", headers=headers)
+                    else:
+                        r = await client.post(f"https://{domain}{target}", headers=headers, json=payload)
+                    if r.status_code in (200, 201, 204):
+                        counts[scope] += 1
+                except Exception as e:
+                    logger.warning("worker %s user sync failed for %s: %s", scope, uid, e)
+    asyncio.create_task(save_state())
+    return {"ok": True, "count": sum(counts.values()), "counts": counts}
 
 
 async def _worker_pull_user(uid: str, u: dict) -> dict:
@@ -7094,7 +7136,7 @@ def _user_uses_worker_inbound(u: dict) -> bool:
     (worker routes, tunnel/reverse chains) — those users need quota/expiry
     synced to the worker KV."""
     iids = u.get("inbound_ids") or ([u.get("inbound_id")] if u.get("inbound_id") else [])
-    return any((INBOUNDS.get(iid) or {}).get("protocol") in ("worker", "tunnel") for iid in iids)
+    return any((INBOUNDS.get(iid) or {}).get("protocol") in ("worker", "tunnel", "reverse") for iid in iids)
 
 
 async def _ensure_worker_inbound() -> bool:
@@ -7128,7 +7170,7 @@ async def _ensure_worker_inbound() -> bool:
                 "fingerprint": "chrome",
                 "reality_settings": {},
                 "xhttp_settings": {},
-                "ws_settings": {"path": "/route/{uuid}"},
+                "ws_settings": {"path": "/route/{country}/{uuid}"},
                 "grpc_settings": {},
                 "created_at": datetime.now().isoformat(),
             }
@@ -7152,7 +7194,7 @@ async def _worker_push_config() -> dict:
     if not domain or not ctrl or domain in ("localhost", "0.0.0.0", "127.0.0.1"):
         return {"ok": False, "detail": "worker not connected / no control token"}
     sync_inbounds = {iid for iid, ib in INBOUNDS.items()
-                     if ((ib or {}).get("protocol") or "").lower() in ("worker", "tunnel")}
+                     if ((ib or {}).get("protocol") or "").lower() in ("worker", "tunnel", "reverse")}
     users = []
     async with USERS_LOCK:
         for uid, u in USERS.items():
@@ -7303,12 +7345,12 @@ def _code_to_flag(code: str) -> str:
     return chr(0x1F1E6 + (ord(code[0]) - ord('A'))) + chr(0x1F1E6 + (ord(code[1]) - ord('A')))
 
 
-def _parse_proxy_daily(text: str, limit_per_country: int = 3) -> dict:
+def _parse_proxy_daily(text: str, limit_per_country: int = 0) -> dict:
     """Parse the daily markdown into {code: {country, proxy, port}}.
 
-    For each country section the first `limit_per_country` IP cells are kept
-    (rows are sorted best-first by risk score). Only sections with a flag emoji
-    are used; ISP-grouped sections are skipped.
+    Keep every unique proxy IP found in each country section by default.
+    `limit_per_country` may be set to a positive integer for an explicit cap.
+    Only sections with a flag emoji are used; ISP-grouped sections are skipped.
     """
     out: dict = {}
     lines = text.splitlines()
@@ -7337,7 +7379,7 @@ def _parse_proxy_daily(text: str, limit_per_country: int = 3) -> dict:
                 cell = _IPCELL_RE.search(line)
                 if cell and cell.group(1) not in picked:
                     picked.append(cell.group(1))
-                    if len(picked) >= limit_per_country:
+                    if limit_per_country > 0 and len(picked) >= limit_per_country:
                         break
             j += 1
         if picked:
@@ -7509,9 +7551,11 @@ async def worker_setup(request: Request, _=Depends(require_auth)):
     worker_name = "spider-" + secrets.token_hex(4)
     worker_domain = _worker_safe_domain(f"{worker_name}.{subdom}.workers.dev")
 
-    # 5. Save connection state, then create KV + deploy.
+    # 5. Save connection state, then create the main + dedicated tunnel/reverse
+    # KVs before deployment so all three fixed inbounds are backed by isolated state.
     async with WORKER_LOCK:
         WORKER.update({
+            "tunnel_enabled": True,
             "connected": True,
             "account_id": account_id,
             "worker_name": worker_name,
@@ -7529,6 +7573,8 @@ async def worker_setup(request: Request, _=Depends(require_auth)):
             "last_error": "",
         })
     kv_id = await _ensure_worker_kv()
+    await _ensure_tunnel_kv()
+    await _ensure_reverse_kv()
     sc, sd = await _worker_deploy()
     await _worker_enable_workers_dev()
     if sc not in (200, 201, 409):
@@ -7546,8 +7592,10 @@ async def worker_setup(request: Request, _=Depends(require_auth)):
     # Pull back the worker-generated configs (its own domain + /route paths)
     # so each panel user's sub serves exactly what this worker accepts.
     await _worker_pull_all_users()
-    # Auto-create/refresh the default Worker inbound to the connected domain.
+    # Auto-create/refresh the three fixed inbounds: Worker, Tunnel, Reverse.
     await _ensure_worker_inbound()
+    await _ensure_tunnel_reverse_inbounds()
+    await _worker_sync_users()
     async with WORKER_LOCK:
         WORKER["last_sync"] = now_ir().isoformat(timespec="seconds")
         WORKER["last_error"] = "" if ctrl_res.get("ok") else ctrl_res.get("detail", "")
@@ -7572,6 +7620,9 @@ async def worker_sync(_=Depends(require_auth)):
             await _worker_sync_users()
         await _worker_pull_all_users()
         await _ensure_worker_inbound()
+        if WORKER.get("tunnel_enabled"):
+            await _ensure_tunnel_reverse_inbounds()
+            await _worker_sync_users()
     async with WORKER_LOCK:
         if sc in (200, 201, 409):
             WORKER["last_sync"] = now_ir().isoformat(timespec="seconds")
@@ -7730,6 +7781,48 @@ async def worker_inbounds(_=Depends(require_auth)):
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TUNNEL — user → Railway → Cloudflare Worker → site
+async def _ensure_tunnel_reverse_inbounds() -> tuple[str | None, str | None]:
+    """Ensure fixed, system-managed Tunnel and Reverse inbounds exist."""
+    panel_domain = _safe_host(SETTINGS.get("domain"), get_host())
+    wdom = _worker_safe_domain(WORKER.get("worker_domain"))
+    if not wdom:
+        return None, None
+    async with INBOUNDS_LOCK:
+        tunnel_id = next((iid for iid, ib in INBOUNDS.items() if (ib.get("protocol") or "").lower() == "tunnel"), None)
+        reverse_id = next((iid for iid, ib in INBOUNDS.items() if (ib.get("protocol") or "").lower() == "reverse"), None)
+        if not tunnel_id:
+            tunnel_id = "default-tunnel"
+            INBOUNDS[tunnel_id] = {
+                "name": "Tunnel (Railway → Worker)", "protocol": "tunnel", "port": 443,
+                "network": "ws", "security": "tls", "domain": panel_domain,
+                "external_domain": panel_domain, "sni": panel_domain, "external_port": 443,
+                "fingerprint": "chrome", "reality_settings": {}, "xhttp_settings": {},
+                "ws_settings": {"path": "/tunnel/{uuid}"}, "grpc_settings": {},
+                "worker_domain": wdom, "system_managed": True, "created_at": datetime.now().isoformat(),
+            }
+        else:
+            ib = INBOUNDS[tunnel_id]
+            ib.update({"name":"Tunnel (Railway → Worker)", "domain":panel_domain, "external_domain":panel_domain,
+                       "sni":panel_domain, "external_port":443, "port":443, "network":"ws", "security":"tls",
+                       "ws_settings":{"path":"/tunnel/{uuid}"}, "worker_domain":wdom, "system_managed":True})
+        if not reverse_id:
+            reverse_id = "default-reverse"
+            INBOUNDS[reverse_id] = {
+                "name": "Reverse (Worker → Railway)", "protocol": "reverse", "port": 443,
+                "network": "ws", "security": "tls", "domain": wdom,
+                "external_domain": wdom, "sni": wdom, "external_port": 443,
+                "fingerprint": "chrome", "reality_settings": {}, "xhttp_settings": {},
+                "ws_settings": {"path": "/reverse/{uuid}"}, "grpc_settings": {},
+                "panel_domain": panel_domain, "system_managed": True, "created_at": datetime.now().isoformat(),
+            }
+        else:
+            ib = INBOUNDS[reverse_id]
+            ib.update({"name":"Reverse (Worker → Railway)", "domain":wdom, "external_domain":wdom,
+                       "sni":wdom, "external_port":443, "port":443, "network":"ws", "security":"tls",
+                       "ws_settings":{"path":"/reverse/{uuid}"}, "panel_domain":panel_domain, "system_managed":True})
+    await save_state()
+    return tunnel_id, reverse_id
+
 # The tunnel inbound is a TLS+WS inbound on the RAILWAY domain with path
 # /tunnel/{uuid}. Railway forwards to the Worker; the Worker connects out to
 # the destination. The tunnel has its own dedicated KV namespace (TUNNEL_KV).
@@ -7744,57 +7837,29 @@ def _tunnel_log(msg: str):
 
 @app.post("/api/tunnel/create")
 async def tunnel_create(_=Depends(require_auth)):
-    """Create the Tunnel inbound + its dedicated KV namespace.
-
-    Steps:
-      1. ensure the TUNNEL_KV namespace exists ({worker}-db-tunnel),
-      2. mark tunnel_enabled → next deploy binds TUNNEL_KV and re-deploys,
-      3. create/refresh the 'default-tunnel' inbound: TLS + WS on the Railway
-         panel domain with ws path /tunnel/{uuid}.
-    """
+    """Create the fixed Tunnel + Reverse inbounds and their dedicated KVs."""
     if not WORKER.get("connected"):
         raise HTTPException(status_code=400, detail="worker is not connected")
     kv_id = await _ensure_tunnel_kv()
-    if not kv_id:
-        raise HTTPException(status_code=500, detail="could not create tunnel KV namespace")
+    rev_id = await _ensure_reverse_kv()
+    if not kv_id or not rev_id:
+        raise HTTPException(status_code=500, detail="could not create tunnel/reverse KV namespaces")
     async with WORKER_LOCK:
         WORKER["tunnel_enabled"] = True
         if not WORKER.get("tunnel_created_at"):
             WORKER["tunnel_created_at"] = now_ir().isoformat(timespec="seconds")
-        _tunnel_log(f"Tunnel KV ساخته شد: {WORKER.get('tunnel_kv_namespace_title')}")
-    # Re-deploy so the TUNNEL_KV binding goes live.
+        _tunnel_log(f"Tunnel KV: {WORKER.get('tunnel_kv_namespace_title')}")
+        _tunnel_log(f"Reverse KV: {WORKER.get('reverse_kv_namespace_title')}")
+    tunnel_id, reverse_id = await _ensure_tunnel_reverse_inbounds()
     sc, sd = await _worker_deploy()
     ok_deploy = sc in (200, 201, 409)
+    if ok_deploy:
+        await _worker_sync_users()
     async with WORKER_LOCK:
-        _tunnel_log("Worker با binding جدید deploy شد" if ok_deploy else f"deploy ناموفق: {sc}")
-    panel_domain = _safe_host(SETTINGS.get("domain"), get_host())
-    async with INBOUNDS_LOCK:
-        INBOUNDS["default-tunnel"] = {
-            "name": "Tunnel (Railway → CF Worker)",
-            "protocol": "tunnel",
-            "port": 443,
-            "network": "ws",
-            "security": "tls",
-            "domain": panel_domain,
-            "external_domain": panel_domain,
-            "sni": "",
-            "spoof_ip": "",
-            "external_port": 443,
-            "fingerprint": "chrome",
-            "reality_settings": {},
-            "xhttp_settings": {},
-            "ws_settings": {"path": "/tunnel/{uuid}"},
-            "grpc_settings": {},
-            "worker_domain": str(WORKER.get("worker_domain") or ""),
-            "created_at": datetime.now().isoformat(),
-        }
-        changed = True
+        _tunnel_log("Worker با KVهای اختصاصی Tunnel/Reverse deploy شد" if ok_deploy else f"deploy ناموفق: {sc}")
     asyncio.create_task(save_state())
-    async with WORKER_LOCK:
-        _tunnel_log(f"اینباند Tunnel روی {panel_domain} با مسیر /tunnel/{{uuid}} ساخته شد")
-    log_activity("tunnel", "اینباند Tunnel ایجاد شد", "ok")
-    asyncio.create_task(save_state())
-    return {"ok": True, **_worker_public(), "deployed": ok_deploy}
+    log_activity("tunnel", "اینباندهای ثابت Tunnel و Reverse ایجاد شدند", "ok")
+    return {"ok": True, "tunnel_inbound_id": tunnel_id, "reverse_inbound_id": reverse_id, **_worker_public(), "deployed": ok_deploy}
 
 
 @app.get("/api/tunnel/status")
@@ -7813,6 +7878,8 @@ async def tunnel_status(_=Depends(require_auth)):
             ping_ms = None
     tid = next((iid for iid, ib in INBOUNDS.items()
                 if ((ib or {}).get("protocol") or "").lower() == "tunnel"), None)
+    rid = next((iid for iid, ib in INBOUNDS.items()
+                if ((ib or {}).get("protocol") or "").lower() == "reverse"), None)
     # Reverse info (shown under the tunnel info in the Tunnel tab).
     rev_ping_ms = None
     if wdom:
@@ -7835,9 +7902,9 @@ async def tunnel_status(_=Depends(require_auth)):
         "panel_domain": _safe_host(SETTINGS.get("domain"), get_host()),
         "tunnel_kv_title": WORKER.get("tunnel_kv_namespace_title", ""),
         "tunnel_kv_id": WORKER.get("tunnel_kv_namespace_id", ""),
-        "reverse_enabled": bool(tid and (INBOUNDS[tid] or {}).get("reverse_enabled")),
+        "reverse_enabled": rid is not None,
         "reverse_ping_ms": rev_ping_ms,
-        "reverse_path": f"/reverse/{{uuid}}" if (tid and (INBOUNDS[tid] or {}).get("reverse_enabled")) else "",
+        "reverse_path": f"/reverse/{{uuid}}" if rid else "",
         "reverse_kv_title": WORKER.get("reverse_kv_namespace_title", ""),
         "reverse_kv_id": WORKER.get("reverse_kv_namespace_id", ""),
         "last_heartbeat": WORKER.get("last_heartbeat", ""),
@@ -7848,57 +7915,12 @@ async def tunnel_status(_=Depends(require_auth)):
 
 @app.post("/api/tunnel/reverse")
 async def tunnel_reverse_toggle(request: Request, _=Depends(require_auth)):
-    """Toggle reverse mode on the tunnel inbound.
-
-    ON:  user → Worker → Railway → site; config domain = worker domain,
-         ws path /reverse/{uuid}; user records live in REVERSE_KV.
-    OFF: back to the plain tunnel chain (user → Railway → Worker → site).
-    """
-    body = await request.json()
-    enabled = bool(body.get("enabled"))
+    """Compatibility endpoint: Reverse is always provisioned as its own fixed inbound."""
     if not WORKER.get("connected"):
         raise HTTPException(status_code=400, detail="worker is not connected")
-    async with INBOUNDS_LOCK:
-        tid = next((iid for iid, ib in INBOUNDS.items()
-                    if ((ib or {}).get("protocol") or "").lower() == "tunnel"), None)
-    if not tid and enabled:
-        # Reverse needs the tunnel inbound (its WS handler serves /reverse on
-        # the Railway leg). Create it instead of failing — the user just
-        # flipped the switch expecting it to work.
-        create_res = await tunnel_create(_=None)
-        async with INBOUNDS_LOCK:
-            tid = next((iid for iid, ib in INBOUNDS.items()
-                        if ((ib or {}).get("protocol") or "").lower() == "tunnel"), None)
-        if not tid:
-            raise HTTPException(status_code=500, detail="could not create tunnel inbound")
-        async with WORKER_LOCK:
-            _tunnel_log("اینباند Tunnel به‌صورت خودکار برای Reverse ساخته شد")
-    async with INBOUNDS_LOCK:
-        INBOUNDS[tid]["reverse_enabled"] = enabled
-    if enabled:
-        # tunnel_enabled gates the TUNNEL_KV + REVERSE_KV bindings at deploy.
-        async with WORKER_LOCK:
-            WORKER["tunnel_enabled"] = True
-        kv_ok = await _ensure_reverse_kv()
-        if not kv_ok:
-            raise HTTPException(status_code=500, detail="could not create reverse KV namespace")
-        async with WORKER_LOCK:
-            _tunnel_log(f"Reverse KV آماده شد: {WORKER.get('reverse_kv_namespace_title')}")
-    # Re-deploy so the REVERSE_KV binding goes live when first needed.
-    sc, sd = await _worker_deploy()
-    ok_deploy = sc in (200, 201, 409)
-    if enabled and ok_deploy:
-        asyncio.create_task(_worker_sync_users())
-    wdom = str(WORKER.get("worker_domain") or "")
-    async with WORKER_LOCK:
-        if enabled:
-            _tunnel_log(f"Reverse فعال شد — دامنه {wdom} با مسیر /reverse/{{uuid}}")
-            _tunnel_log("Worker با REVERSE_KV deploy شد" if ok_deploy else f"deploy ناموفق: {sc}")
-        else:
-            _tunnel_log("Reverse غیرفعال شد")
-    log_activity("tunnel", f"Reverse {'فعال' if enabled else 'غیرفعال'} شد", "ok")
-    asyncio.create_task(save_state())
-    return {"ok": True, "enabled": enabled, **_worker_public(), "deployed": ok_deploy}
+    _, reverse_id = await _ensure_tunnel_reverse_inbounds()
+    await _worker_sync_users()
+    return {"ok": True, "enabled": True, "reverse_inbound_id": reverse_id, **_worker_public()}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -8195,7 +8217,7 @@ async def scanner_sni_fastest(_=Depends(require_auth)):
 # ══════════════════════════════════════════════════════════════════════════════
 
 @app.get("/api/server-info")
-async def get_server_info(_=Depends(require_auth)):
+async def get_server_info(_=Depends(require_panel_or_node)):
     """Return the detected server IP and country."""
     async with SERVER_INFO_LOCK:
         return dict(SERVER_INFO)
@@ -8234,6 +8256,92 @@ async def verify_panel_api_key(request: Request, _=Depends(require_auth)):
         raise HTTPException(status_code=401, detail="API Key is invalid")
     return {"ok": True}
 
+
+# ── NODE inbound / config helpers ────────────────────────────────────────────
+async def _ensure_node_inbound() -> str | None:
+    """Create the system-managed NODE inbound only after a node exists."""
+    if not NODES:
+        return None
+    nd = _safe_host(SETTINGS.get("domain"), get_host())
+    async with INBOUNDS_LOCK:
+        for iid, ib in INBOUNDS.items():
+            if (ib.get("protocol") or "").lower() == "node":
+                # Keep this inbound system-owned and non-editable.
+                ib["name"] = "NODE (Multi-Node Sync)"
+                ib["domain"] = nd
+                ib["external_domain"] = nd
+                ib["external_port"] = 443
+                ib["port"] = 443
+                ib["network"] = "ws"
+                ib["security"] = "tls"
+                ib["ws_settings"] = {"path": "/ws/{uuid}"}
+                ib["system_managed"] = True
+                return iid
+        iid = "default-node"
+        INBOUNDS[iid] = {
+            "name": "NODE (Multi-Node Sync)",
+            "protocol": "node",
+            "port": 443,
+            "network": "ws",
+            "security": "tls",
+            "domain": nd,
+            "external_domain": nd,
+            "sni": nd,
+            "external_port": 443,
+            "fingerprint": "chrome",
+            "reality_settings": {},
+            "xhttp_settings": {},
+            "ws_settings": {"path": "/ws/{uuid}"},
+            "grpc_settings": {},
+            "created_at": datetime.now().isoformat(),
+            "system_managed": True,
+        }
+    await save_state()
+    log_activity("inbound", "اینباند NODE پس از افزودن اولین Node ساخته شد", "ok")
+    return iid
+
+def _node_base_url(url: str) -> str:
+    return str(url or "").strip().rstrip("/")
+
+def _node_config_for_user(node: dict, config_uuid: str, username: str) -> str:
+    base = _node_base_url(node.get("url"))
+    if not base or not config_uuid:
+        return ""
+    raw = re.sub(r"^https?://", "", base).rstrip("/")
+    # Remote node panels are themselves HTTPS endpoints; the node's VLESS
+    # listener is exposed through the same hostname on 443.
+    host = raw.split("/", 1)[0]
+    if not host:
+        return ""
+    path = f"/ws/{config_uuid}"
+    params = ("encryption=none&security=tls&type=ws"
+              f"&host={quote(host)}&path={quote(path, safe='')}&sni={quote(host)}"
+              "&fp=chrome&alpn=http/1.1")
+    return f"vless://{config_uuid}@{host}:443?{params}#{quote(f'Spider-{username} {node.get('name','Node')}')}"
+
+async def _refresh_node_user_configs(user_ids=None):
+    """Refresh the node config list on every user that uses the NODE inbound."""
+    node_inbound = any((ib.get("protocol") or "").lower() == "node" for ib in INBOUNDS.values())
+    if not node_inbound:
+        return 0
+    async with NODES_LOCK:
+        nodes_snap = list(NODES.items())
+    if not nodes_snap:
+        return 0
+    async with USERS_LOCK:
+        targets = [(uid, u) for uid, u in USERS.items()
+                   if (not user_ids or uid in user_ids) and
+                      ((u.get("inbound_ids") or []) and any(iid and (INBOUNDS.get(iid) or {}).get("protocol") == "node" for iid in u.get("inbound_ids") or []))]
+        for uid, u in targets:
+            cfgs = []
+            for nid, node in nodes_snap:
+                cfg = _node_config_for_user(node, u.get("config_uuid", uid), u.get("username", uid))
+                if cfg:
+                    cfgs.append({"node_id": nid, "node": node.get("name", nid), "config": cfg})
+            u["node_configs"] = cfgs
+    if targets:
+        asyncio.create_task(save_state())
+    return len(targets)
 
 # ── NODE Management ──────────────────────────────────────────────────────────
 
@@ -8316,9 +8424,22 @@ async def add_node(request: Request, _=Depends(require_auth)):
             "last_sync": datetime.now().isoformat(),
             "created_at": datetime.now().isoformat(),
         }
+    node_inbound_id = await _ensure_node_inbound()
+    # The first Node creates the selector inbound. Existing NODE users are then
+    # replicated onto the newly registered node and their subscription gets the
+    # new node config as well.
+    existing_node_users = []
+    async with USERS_LOCK:
+        for uid, u in USERS.items():
+            iids = u.get("inbound_ids") or []
+            if node_inbound_id and node_inbound_id in iids:
+                existing_node_users.append((uid, dict(u)))
+    for uid, u in existing_node_users:
+        await _create_user_on_nodes(u.get("config_uuid", uid), {"username": u.get("username", uid)}, only_node_id=node_id)
+    await _refresh_node_user_configs([uid for uid, _ in existing_node_users])
     asyncio.create_task(save_state())
     log_activity("node", f"نود «{uname}» اضافه شد", "ok")
-    return {"ok": True, "node_id": node_id, "name": uname, "region": region}
+    return {"ok": True, "node_id": node_id, "name": uname, "region": region, "inbound_id": node_inbound_id}
 
 
 @app.delete("/api/nodes/{node_id}")
@@ -8361,36 +8482,74 @@ async def _delete_user_from_nodes(config_uuid: str):
 
 
 # ── NODE Inbound: create users on all nodes ─────────────────────────────────
-async def _create_user_on_nodes(config_uuid: str, user_data: dict):
-    """Best-effort: create a user on all active nodes for NODE inbound."""
+async def _create_user_on_nodes(config_uuid: str, user_data: dict, only_node_id: str | None = None):
+    """Create/sync the same user UUID on every active node and collect configs."""
     async with NODES_LOCK:
         nodes_snap = dict(NODES)
+    if only_node_id:
+        nodes_snap = {only_node_id: nodes_snap[only_node_id]} if only_node_id in nodes_snap else {}
     results = []
+    collected = []
     for nid, node in nodes_snap.items():
         api_key = node.get("api_key", "")
-        url = (node.get("url") or "").strip().rstrip("/")
+        url = _node_base_url(node.get("url"))
         if not url or not api_key:
             continue
         try:
-            payload = {
-                "username": user_data.get("username", ""),
-                "config_uuid": config_uuid,
-                "traffic_limit_gb": 0,
-                "expire_days": 0,
-                "concurrent_connections": 0,
-                "inbound_id": "default",  # each node uses its own default inbound
-            }
-            async with httpx.AsyncClient(timeout=10) as client:
+            inbound_id = "default"
+            async with httpx.AsyncClient(timeout=15) as client:
+                ir = await client.get(f"{url}/api/inbounds", headers={"X-API-Key": api_key})
+                if ir.status_code == 200:
+                    try:
+                        remote_inbounds = ir.json().get("inbounds") or []
+                        selectable = [x for x in remote_inbounds if str(x.get("protocol") or "").lower() not in ("worker", "tunnel", "reverse", "telegram", "wireguard")]
+                        if selectable:
+                            inbound_id = selectable[0].get("inbound_id") or "default"
+                    except Exception:
+                        pass
+                payload = {
+                    "username": user_data.get("username", ""),
+                    "password": secrets.token_urlsafe(12),
+                    "config_uuid": config_uuid,
+                    "traffic_limit_gb": 0,
+                    "expire_days": 0,
+                    "concurrent_connections": 0,
+                    "inbound_id": inbound_id,
+                }
                 r = await client.post(
                     f"{url}/api/users",
                     headers={"X-API-Key": api_key, "Content-Type": "application/json"},
                     json=payload,
                 )
-                ok = r.status_code in (200, 201)
-                results.append({"node": node.get("name", nid), "ok": ok, "status": r.status_code})
+            ok = r.status_code in (200, 201, 409)
+            detail = ""
+            remote_cfg = ""
+            if r.status_code in (200, 201):
+                try:
+                    data = r.json()
+                    remote_cfg = str(data.get("config") or "").strip()
+                except Exception:
+                    pass
+            elif r.status_code == 409:
+                # Same UUID/name may already exist on the node; the deterministic
+                # local config below still remains valid for the node.
+                detail = "already exists"
+            if not remote_cfg:
+                remote_cfg = _node_config_for_user(node, config_uuid, user_data.get("username", config_uuid))
+            if remote_cfg:
+                collected.append({"node_id": nid, "node": node.get("name", nid), "config": remote_cfg})
+            results.append({"node": node.get("name", nid), "ok": ok, "status": r.status_code, "detail": detail})
         except Exception as e:
             results.append({"node": node.get("name", nid), "ok": False, "error": str(e)[:100]})
             logger.warning("create user on node %s failed: %s", node.get("name"), e)
+    # Persist collected configs on the matching local user record.
+    async with USERS_LOCK:
+        for uid, u in USERS.items():
+            if u.get("config_uuid") == config_uuid:
+                u["node_configs"] = collected
+                break
+    if collected:
+        asyncio.create_task(save_state())
     return results
 
 
@@ -8448,6 +8607,8 @@ async def subscription_by_uuid(uuid: str, request: Request):
                         configs.append(cfg)
             except Exception:
                 continue
+        if target_user.get("node_configs"):
+            configs.extend(c.get("config") for c in target_user.get("node_configs") if c.get("config"))
         if not configs:
             fallback_config = generate_user_config(target_uid, target_user, target_user.get("inbound_id"))
             configs = [fallback_config] if fallback_config else []
@@ -8494,6 +8655,8 @@ async def subscription_index(_=Depends(require_auth)):
                 tunnel_items.append({"id": iid, "name": name, "category": "Worker", "type": "tunnel"})
             elif proto == "tunnel":
                 tunnel_items.append({"id": iid, "name": name, "category": "Tunnel", "type": "tunnel"})
+            elif proto == "reverse":
+                tunnel_items.append({"id": iid, "name": name, "category": "Reverse", "type": "reverse"})
             elif proto == "reality":
                 tunnel_items.append({"id": iid, "name": name, "category": "Reality", "type": "tunnel"})
             elif proto == "vless":
@@ -8548,7 +8711,7 @@ async def bot_setup(request: Request, _=Depends(require_auth)):
     if not channel_id:
         raise HTTPException(status_code=400, detail="Channel ID is required")
     # Validate token
-    from spider_features import validate_bot_token, check_bot_channel_access
+    from spider_features import validate_bot_token, check_bot_channel_access, tg_api_call
     try:
         bot_info = await validate_bot_token(token)
     except ValueError as e:
@@ -8558,10 +8721,20 @@ async def bot_setup(request: Request, _=Depends(require_auth)):
         await check_bot_channel_access(token, channel_id)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    target_channel_link = ""
+    try:
+        chat = await tg_api_call(token, "getChat", chat_id=channel_id)
+        username = str((chat.get("username") if isinstance(chat, dict) else "") or "").strip().lstrip("@")
+        if username:
+            target_channel_link = f"https://t.me/{username}"
+    except Exception:
+        target_channel_link = channel_id if str(channel_id).startswith(("http://", "https://", "@")) else ""
     async with BOT_CONFIG_LOCK:
         BOT_CONFIG["bot_token"] = token
         BOT_CONFIG["channel_id"] = channel_id
-        BOT_CONFIG.pop("promotion_channel", None)
+        BOT_CONFIG["promotion_channel"] = str(body.get("promotion_channel") or BOT_CONFIG.get("promotion_channel") or "").strip()
+        BOT_CONFIG["fixed_channel"] = str(body.get("fixed_channel") or BOT_CONFIG.get("fixed_channel") or "").strip()
+        BOT_CONFIG["target_channel_link"] = target_channel_link or BOT_CONFIG.get("target_channel_link", "")
         BOT_CONFIG["last_error"] = ""
     asyncio.create_task(save_state())
     log_activity("bot", "ربات کانال تنظیم شد", "ok")
@@ -8635,7 +8808,9 @@ async def _bot_loop():
                 value = BOT_CONFIG.get("interval_value", 10)
                 unit = BOT_CONFIG.get("interval_unit", "seconds")
                 running = BOT_CONFIG.get("running", False)
+                promo = str(BOT_CONFIG.get("promotion_channel") or "").strip()
 
+            host = _safe_host(SETTINGS.get("domain"), get_host())
             if not running or not token or not channel_id:
                 break
 
@@ -8676,8 +8851,7 @@ async def _bot_loop():
             async with INBOUNDS_LOCK:
                 available = [
                     (iid, ib) for iid, ib in INBOUNDS.items()
-                    if (ib.get("protocol") or "").lower() not in ("telegram", "wireguard", "node")
-                    and (ib.get("protocol") or "").lower() != "worker"
+                    if (ib.get("protocol") or "").lower() not in ("telegram", "wireguard", "node", "worker", "tunnel", "reverse")
                 ]
             if not available:
                 async with BOT_CONFIG_LOCK:
@@ -8773,13 +8947,27 @@ async def _bot_loop():
 
             # 5) Send to Telegram channel
             try:
-                caption_lines = [f"🔗 <code>{sub_url}</code>"]
+                async with BOT_CONFIG_LOCK:
+                    target_link = str(BOT_CONFIG.get("target_channel_link") or "").strip()
+                    fixed_channel = str(BOT_CONFIG.get("fixed_channel") or "").strip()
+                caption_lines = [f"🔗 <b>Subscription</b>\n<code>{sub_url}</code>"]
+                if target_link:
+                    shown = target_link if target_link.startswith("http") else f"https://t.me/{target_link.lstrip('@')}"
+                    caption_lines.append(f"\n<a href=\"{shown}\">Target Channel</a>")
+                elif str(channel_id).startswith("@"):
+                    shown = f"https://t.me/{str(channel_id).lstrip('@')}"
+                    caption_lines.append(f"\n<a href=\"{shown}\">Target Channel</a>")
+                if fixed_channel:
+                    fixed = fixed_channel
+                    if fixed.startswith("@"):
+                        fixed = f"https://t.me/{fixed.lstrip('@')}"
+                    elif not fixed.startswith(("http://", "https://")):
+                        fixed = f"https://t.me/{fixed.lstrip('@')}"
+                    caption_lines.append(f"<a href=\"{fixed}\">Fixed Channel</a>")
                 if promo:
                     caption_lines.append("")
-                    caption_lines.append(promo)
+                    caption_lines.append(f"Promotion: <code>{promo}</code>")
                 caption_lines.append("")
-                caption_lines.append("")
-                caption_lines.append("Spider Panel by Amir")
                 caption_lines.append('<a href="https://t.me/amirsp1ider">Spider Panel by Amir</a>')
                 caption = "\n".join(caption_lines)
 
@@ -8800,10 +8988,9 @@ async def _bot_loop():
                             )
                             res = r.json()
                             if not res.get("ok"):
-                                logger.warning("Telegram send photo failed: %s", res.get("description", ""))
+                                raise RuntimeError(res.get("description", "Telegram sendPhoto failed"))
                 else:
-                    # Fallback: send text only
-                    await tg_api_call(token, "sendMessage", chat_id=channel_id, text=caption, parse_mode="HTML")
+                    raise RuntimeError("QR code is unavailable; refusing to send a text-only bot post")
 
                 async with BOT_CONFIG_LOCK:
                     BOT_CONFIG["last_run"] = datetime.now().isoformat()

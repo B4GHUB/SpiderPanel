@@ -638,6 +638,8 @@ a{color:inherit;text-decoration:none}
     <div class="nav-item" data-page="logs"><i class="ti ti-history"></i> لاگ‌ها</div>
     <div class="nav-section">سیستم</div>
     <div class="nav-item" data-page="worker"><i class="ti ti-cloud"></i> Cloudflare Worker</div>
+    <div class="nav-item" data-page="bot"><i class="ti ti-brand-telegram"></i> Telegram Bot</div>
+    <div class="nav-item" data-page="node"><i class="ti ti-server"></i> Nodeها</div>
     <div class="nav-item" data-page="api"><i class="ti ti-api"></i> API</div>
     <div class="nav-item" data-page="tools"><i class="ti ti-tools"></i> ابزارها</div>
     <div class="nav-item" data-page="settings"><i class="ti ti-settings"></i> تنظیمات</div>
@@ -895,23 +897,10 @@ a{color:inherit;text-decoration:none}
       </div>
       <div style="padding:18px 22px" id="worker-connect-form">
         <div class="form-row">
-          <div class="form-field">
-            <label><i class="ti ti-key"></i> توکن API Cloudflare</label>
-            <input class="form-input" id="worker-token" type="password" placeholder="توکن API (Bearer یا Global Key)" dir="ltr">
-          </div>
-          <div class="form-field">
-            <label><i class="ti ti-at"></i> ایمیل (برای Global Key)</label>
-            <input class="form-input" id="worker-email" type="email" placeholder="email@example.com" dir="ltr">
-          </div>
-        </div>
-        <div class="form-row">
-          <div class="form-field">
-            <label><i class="ti ti-database"></i> Account ID</label>
-            <input class="form-input" id="worker-account-id" placeholder="Account ID از داشبورد Cloudflare" dir="ltr">
-          </div>
-          <div class="form-field">
-            <label><i class="ti ti-brand-cloudflare"></i> نام Worker (اختیاری)</label>
-            <input class="form-input" id="worker-name" value="spider-proxy" placeholder="spider-proxy" dir="ltr">
+          <div class="form-field" style="grid-column:1/-1">
+            <label><i class="ti ti-key"></i> API Token Cloudflare</label>
+            <input class="form-input" id="worker-token" type="password" placeholder="توکن با دسترسی Workers Scripts + KV" dir="ltr" autocomplete="off">
+            <small style="display:block;margin-top:7px;color:var(--text-secondary)">با همین یک توکن، Account ID، Worker و KV به‌صورت خودکار ساخته و متصل می‌شوند.</small>
           </div>
         </div>
         <div style="margin-top:12px;display:flex;gap:8px">
@@ -927,6 +916,13 @@ a{color:inherit;text-decoration:none}
         <div class="form-row">
           <div class="form-field"><label><i class="ti ti-tag"></i> نام Worker</label><input class="form-input" id="worker-name-display" readonly dir="ltr"></div>
           <div class="form-field"><label><i class="ti ti-key"></i> توکن کنترل</label><input class="form-input" id="worker-control-token-display" readonly dir="ltr" style="font-family:monospace;font-size:12px"></div>
+        </div>
+        <div class="table-wrap" style="margin-top:14px">
+          <div style="padding:14px 18px;border-bottom:1px solid var(--border)"><div class="server-title" style="margin-bottom:0"><i class="ti ti-lock"></i> اینباندهای سیستمی (قابل ویرایش نیستند)</div></div>
+          <div style="padding:0 18px 10px">
+            <table><thead><tr><th>نوع</th><th>دامنه</th><th>Path</th><th>وضعیت</th></tr></thead>
+            <tbody id="worker-fixed-inbounds"><tr><td colspan="4" style="text-align:center;padding:18px;color:var(--text-secondary)">—</td></tr></tbody></table>
+          </div>
         </div>
         <div style="margin-top:12px;display:flex;gap:8px">
           <button class="btn btn-primary" onclick="syncWorkerProxies()"><i class="ti ti-refresh-cw"></i> همگام‌سازی پروکسی‌ها</button>
@@ -973,6 +969,60 @@ a{color:inherit;text-decoration:none}
       <div style="padding:18px 22px">
         <div id="worker-last-sync-info"></div>
       </div>
+    </div>
+  </section>
+
+  <!-- BOT PAGE -->
+  <section class="page" id="page-bot">
+    <div class="topbar">
+      <div><div class="topbar-title"><i class="ti ti-brand-telegram"></i> Telegram Bot</div><div class="topbar-sub">ساخت کاربر دوره‌ای و ارسال QR به کانال</div></div>
+      <div class="topbar-right"><span class="badge badge-blue" id="bot-status-badge">خاموش</span></div>
+    </div>
+    <div class="table-wrap">
+      <div style="padding:18px 22px;border-bottom:1px solid var(--border)"><div class="server-title" style="margin-bottom:0"><i class="ti ti-settings"></i> تنظیمات Bot</div></div>
+      <div style="padding:18px 22px">
+        <div class="form-row">
+          <div class="form-field"><label><i class="ti ti-key"></i> Bot Token</label><input class="form-input" id="bot-token" type="password" dir="ltr" autocomplete="off"></div>
+          <div class="form-field"><label><i class="ti ti-hash"></i> Target Channel ID / @username</label><input class="form-input" id="bot-channel-id" dir="ltr" placeholder="-100123... یا @channel"></div>
+        </div>
+        <div class="form-row">
+          <div class="form-field"><label><i class="ti ti-link"></i> Fixed Channel</label><input class="form-input" id="bot-fixed-channel" dir="ltr" placeholder="@fixed_channel یا https://t.me/fixed_channel"></div>
+          <div class="form-field"><label><i class="ti ti-speakerphone"></i> Promotion Tag</label><input class="form-input" id="bot-promotion" dir="ltr" placeholder="متن یا تگ 32-کاراکتری MTProxy"></div>
+        </div>
+        <div class="form-row">
+          <div class="form-field"><label><i class="ti ti-clock"></i> فاصله ارسال</label><input class="form-input" id="bot-interval" type="number" min="1" value="10" dir="ltr"></div>
+          <div class="form-field"><label><i class="ti ti-adjustments"></i> واحد</label><select class="form-select" id="bot-unit"><option value="seconds">ثانیه</option><option value="minutes">دقیقه</option><option value="hours">ساعت</option></select></div>
+        </div>
+        <div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap">
+          <button class="btn btn-primary" onclick="saveBot()"><i class="ti ti-device-floppy"></i> ذخیره و اعتبارسنجی</button>
+          <button class="btn btn-ghost" onclick="startBot()"><i class="ti ti-player-play"></i> شروع</button>
+          <button class="btn btn-danger" onclick="stopBot()"><i class="ti ti-player-stop"></i> توقف</button>
+        </div>
+        <div id="bot-error" style="margin-top:12px;color:var(--spider-red);font-size:12px"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- NODE PAGE -->
+  <section class="page" id="page-node">
+    <div class="topbar">
+      <div><div class="topbar-title"><i class="ti ti-server"></i> Nodeها</div><div class="topbar-sub">هر Node یک SpiderPanel جداست؛ بعد از اولین Node، اینباند Node ساخته می‌شود</div></div>
+      <div class="topbar-right"><button class="btn btn-primary" onclick="addNode()"><i class="ti ti-plus"></i> افزودن Node</button></div>
+    </div>
+    <div class="table-wrap" style="margin-bottom:18px">
+      <div style="padding:18px 22px;border-bottom:1px solid var(--border)"><div class="server-title" style="margin-bottom:0"><i class="ti ti-key"></i> اتصال Node</div></div>
+      <div style="padding:18px 22px">
+        <div class="form-row">
+          <div class="form-field"><label>Node URL</label><input class="form-input" id="node-url" dir="ltr" placeholder="https://node.example.com"></div>
+          <div class="form-field"><label>Panel API Key</label><input class="form-input" id="node-api-key" type="password" dir="ltr"></div>
+        </div>
+        <div class="form-row"><div class="form-field"><label>نام Node</label><input class="form-input" id="node-name" dir="ltr" placeholder="node-1"></div></div>
+        <div id="panel-api-key-hint" style="font-size:12px;color:var(--text-secondary)"></div>
+      </div>
+    </div>
+    <div class="table-wrap">
+      <div style="padding:18px 22px;border-bottom:1px solid var(--border)"><div class="server-title" style="margin-bottom:0"><i class="ti ti-list"></i> Nodeهای ثبت‌شده</div></div>
+      <div style="padding:0 18px 10px"><table><thead><tr><th>نام</th><th>Region</th><th>URL</th><th>وضعیت</th><th>آخرین Sync</th><th>عملیات</th></tr></thead><tbody id="nodes-table"><tr><td colspan="6" style="text-align:center;padding:24px;color:var(--text-secondary)">در حال بارگذاری...</td></tr></tbody></table></div>
     </div>
   </section>
 </main>
@@ -1033,7 +1083,7 @@ function switchPage(name){
   document.querySelectorAll('.nav-item').forEach(function(el){el.classList.toggle('active',el.dataset.page===name)});
   document.querySelectorAll('.page').forEach(function(el){el.classList.toggle('active',el.id==='page-'+name)});
   toggleSidebar();window.scrollTo({top:0,behavior:'smooth'});
-  var loaders={users:loadUsers,configs:loadConfigs,traffic:loadTraffic,logs:loadLogs,dash:loadDashboard,settings:loadSettings,worker:loadWorker};
+  var loaders={users:loadUsers,configs:loadConfigs,traffic:loadTraffic,logs:loadLogs,dash:loadDashboard,settings:loadSettings,worker:loadWorker,bot:loadBot,node:loadNodes};
   if(loaders[name])loaders[name]();
 }
 document.querySelectorAll('.nav-item').forEach(function(el){el.onclick=function(){switchPage(el.dataset.page)}});
@@ -1434,6 +1484,7 @@ async function loadWorker(){
 
       // Render proxies table
       renderWorkerProxies(d.proxies || []);
+      renderFixedWorkerInbounds(d.fixed_inbounds || []);
 
       // Last sync info
       if(d.last_sync){
@@ -1483,12 +1534,9 @@ function renderWorkerProxies(proxies){
 
 async function connectWorker(){
   var token=document.getElementById('worker-token').value.trim();
-  var email=document.getElementById('worker-email').value.trim();
-  var account_id=document.getElementById('worker-account-id').value.trim();
-  var worker_name=document.getElementById('worker-name').value.trim()||'spider-proxy';
-  if(!token||!account_id){toast('توکن و Account ID الزامی هستند','err');return}
+  if(!token){toast('API Token الزامی است','err');return}
   try{
-    var r=await authFetch('/api/worker/setup',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:token,account_id:account_id,email:email,worker_name:worker_name})});
+    var r=await authFetch('/api/worker/setup',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:token})});
     var d=await r.json();
     if(!d.ok)throw new Error(d.detail||'خطا');
     toast('Worker با موفقیت متصل و دیپلوی شد ✓','ok');
@@ -1568,9 +1616,53 @@ async function openAddProxyModal(){
   }catch(e){toast(e.message,'err')}
 }
 
+function renderFixedWorkerInbounds(items){
+  var el=document.getElementById('worker-fixed-inbounds'); if(!el)return;
+  if(!items.length){el.innerHTML='<tr><td colspan="4" style="text-align:center;padding:18px;color:var(--text-secondary)">پس از اتصال Worker ساخته می‌شوند</td></tr>';return;}
+  var labels={worker:'Worker',tunnel:'Tunnel',reverse:'Reverse'};
+  el.innerHTML=items.map(function(x){return '<tr><td>'+esc(labels[x.protocol]||x.protocol)+'</td><td style="font-family:monospace" dir="ltr">'+esc(x.domain||'')+'</td><td style="font-family:monospace" dir="ltr">'+esc(x.path||'')+'</td><td><span class="badge badge-blue"><i class="ti ti-lock"></i> ثابت</span></td></tr>'}).join('');
+}
+
+async function loadBot(){
+  try{var r=await authFetch('/api/bot'),d=await r.json();
+    document.getElementById('bot-token').value='';
+    document.getElementById('bot-channel-id').value=d.channel_id||'';
+    document.getElementById('bot-fixed-channel').value=d.fixed_channel||'';
+    document.getElementById('bot-promotion').value=d.promotion_channel||'';
+    document.getElementById('bot-interval').value=d.interval_value||10;
+    document.getElementById('bot-unit').value=d.interval_unit||'seconds';
+    var b=document.getElementById('bot-status-badge'); b.textContent=d.running?'روشن':'خاموش';
+    b.className='badge '+(d.running?'badge-green':'badge-blue');
+    document.getElementById('bot-error').textContent=d.last_error||'';
+  }catch(e){console.error(e)}
+}
+async function saveBot(){
+  var payload={bot_token:document.getElementById('bot-token').value.trim(),channel_id:document.getElementById('bot-channel-id').value.trim(),fixed_channel:document.getElementById('bot-fixed-channel').value.trim(),promotion_channel:document.getElementById('bot-promotion').value.trim()};
+  try{var r=await authFetch('/api/bot/setup',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)}),d=await r.json();if(!d.ok)throw new Error(d.detail||'خطا');
+    await authFetch('/api/bot/schedule',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({interval_value:parseInt(document.getElementById('bot-interval').value||10),interval_unit:document.getElementById('bot-unit').value})});
+    toast('Bot ذخیره و اعتبارسنجی شد ✓','ok'); loadBot();
+  }catch(e){toast(e.message,'err')}
+}
+async function startBot(){try{var r=await authFetch('/api/bot/start',{method:'POST'}),d=await r.json();if(!d.ok)throw new Error(d.detail||'خطا');toast('Bot شروع شد ✓','ok');loadBot()}catch(e){toast(e.message,'err')}}
+async function stopBot(){try{var r=await authFetch('/api/bot/stop',{method:'POST'}),d=await r.json();if(!d.ok)throw new Error(d.detail||'خطا');toast('Bot متوقف شد ✓','ok');loadBot()}catch(e){toast(e.message,'err')}}
+
+async function loadNodes(){
+  try{var r=await authFetch('/api/nodes'),d=await r.json();var t=document.getElementById('nodes-table');
+    if(!d.nodes||!d.nodes.length){t.innerHTML='<tr><td colspan="6" style="text-align:center;padding:24px;color:var(--text-secondary)">هنوز Node اضافه نشده؛ بنابراین Inbound آن هم ساخته نشده است</td></tr>'}
+    else t.innerHTML=d.nodes.map(function(n){return '<tr><td>'+esc(n.name)+'</td><td>'+esc(n.region||'')+'</td><td dir="ltr" style="font-family:monospace;font-size:11px">'+esc(n.url)+'</td><td><span class="badge badge-green">'+esc(n.status||'active')+'</span></td><td dir="ltr">'+esc(n.last_sync||'')+'</td><td><button class="btn btn-sm btn-danger" onclick="deleteNode(\''+esc(n.id)+'\')"><i class="ti ti-trash"></i></button></td></tr>'}).join('');
+    var hint=document.getElementById('panel-api-key-hint'); if(hint){try{var kr=await authFetch('/api/panel-api-key'),kd=await kr.json();hint.textContent=kd.api_key?'API Key این SpiderPanel برای قرار دادن روی Node: '+kd.api_key:''}catch(_){}}
+  }catch(e){console.error(e)}
+}
+async function addNode(){
+  var url=document.getElementById('node-url').value.trim(), key=document.getElementById('node-api-key').value.trim(), name=document.getElementById('node-name').value.trim();
+  if(!url||!key){toast('URL و API Key الزامی است','err');return}
+  try{var r=await authFetch('/api/nodes',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url:url,api_key:key,name:name})}),d=await r.json();if(!d.ok)throw new Error(d.detail||'خطا');toast('Node اضافه شد و کاربران همگام شدند ✓','ok');document.getElementById('node-url').value='';document.getElementById('node-api-key').value='';document.getElementById('node-name').value='';loadNodes();loadUsers()}catch(e){toast(e.message,'err')}
+}
+async function deleteNode(id){if(!confirm('Node حذف شود؟'))return;try{var r=await authFetch('/api/nodes/'+id,{method:'DELETE'}),d=await r.json();if(!d.ok)throw new Error(d.detail||'خطا');toast('Node حذف شد ✓','ok');loadNodes();loadUsers()}catch(e){toast(e.message,'err')}}
+
 /* ============ REFRESH ============ */
 function refreshAll(){
-  loadDashboard();loadUsers();loadConfigs();loadTraffic();loadLogs();loadWorker();
+  loadDashboard();loadUsers();loadConfigs();loadTraffic();loadLogs();loadWorker();loadBot();loadNodes();
   toast('بروزرسانی شد ✓','ok');
 }
 
@@ -1586,6 +1678,8 @@ document.addEventListener('DOMContentLoaded',async function(){
     if(currentPage==='logs')loadLogs();
     if(currentPage==='settings')loadSettings();
     if(currentPage==='worker')loadWorker();
+    if(currentPage==='bot')loadBot();
+    if(currentPage==='node')loadNodes();
   },5000);
 });
 </script>

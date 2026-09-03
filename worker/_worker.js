@@ -5,7 +5,7 @@
 //
 // Route handling:
 //   /{uuid}          → direct VLESS WS tunnel (user's assigned proxy_ip)
-//   /route/{code}    → multi-location: looks up country proxy from KV, authenticates
+//   /route/{country}/{uuid}    → multi-location: looks up country proxy from KV, authenticates
 //                       user from the VLESS header UUID
 //
 // Injected at deploy time:
@@ -432,7 +432,7 @@ async function handleVlessWs(request, env, country, preUser) {
       if (!h) { try { server.close(4002, 'bad header'); } catch(e){} return; }
       server.__h = h;
 
-      // Resolve user: preUser for /{uuid} paths, or from VLESS header for /route/{code}
+      // Resolve user: preUser for /{uuid} paths, or from VLESS header for /route/{country}/{uuid}
       let user = preUser;
       if (!user && h.userId) {
         user = await getUser(env, h.userId.toLowerCase());
@@ -460,7 +460,7 @@ async function handleVlessWs(request, env, country, preUser) {
       if (!conn && !country && !user.proxy_ip) {
         // No route and no per-user proxy: last resort is any configured relay,
         // but ONLY when the client didn't request a specific country — a
-        // /route/{code} request must never exit from another country's IP.
+        // /route/{country}/{uuid} request must never exit from another country's IP.
         const anyEntry = await getAnyProxy(env);
         if (anyEntry) conn = await connectViaProxy(anyEntry, h.address, h.port);
       }
@@ -516,14 +516,14 @@ async function handleVlessWs(request, env, country, preUser) {
 }
 
 // ── Reverse Relay: Worker → Railway ────────────────────────────────────────
-// Opens a WSS connection back to the panel (Railway) on /tunnel/{uuid} and
+// Opens a WSS connection back to the panel (Railway) on /reverse/{uuid} and
 // writes the client's raw VLESS bytes into it. Railway then re-parses the
 // VLESS header and performs the final egress to the site. Returns a conn-like
 // {socket, reader, writer} where writes go into the WSS and reads come out.
 async function openReverseRelay(uuid, firstChunk) {
   if (!PANEL_DOMAIN) return null;
   try {
-    const url = 'wss://' + PANEL_DOMAIN + '/tunnel/' + encodeURIComponent(uuid);
+    const url = 'wss://' + PANEL_DOMAIN + '/reverse/' + encodeURIComponent(uuid);
     const ws = new WebSocket(url);
     ws.binaryType = 'arraybuffer';
     const opened = new Promise((res, rej) => {
@@ -576,8 +576,8 @@ async function openReverseRelay(uuid, firstChunk) {
 //       tunnel  → DIRECT to the VLESS target
 //                 (user → Railway → this Worker → site)
 //       reverse → WSS relay BACK to the panel domain on /tunnel/{uuid}
-//                 (user → this Worker → Railway → site); Railway's normal
-//                 proxy_connect pipeline performs the final egress.
+//                 (user → this Worker → Railway → site); Railway's /reverse/{uuid}
+//                 endpoint performs the final egress.
 async function handleTunnelWs(request, env, user, reverse) {
   const pair = new WebSocketPair();
   const [client, server] = Object.values(pair);
@@ -708,7 +708,7 @@ function workerConfigsForUser(u) {
   const out = [];
   const countries = Array.isArray(u.countries) && u.countries.length ? u.countries : [''];
   for (const code of countries) {
-    const path = code ? `/route/${encodeURIComponent(String(code).toLowerCase())}` : `/${u.uuid}`;
+    const path = code ? `/route/${encodeURIComponent(String(code).toLowerCase())}/${encodeURIComponent(String(u.uuid).toLowerCase())}` : `/${u.uuid}`;
     const remark = `${u.remark || 'user'}${code ? ' ' + String(code).toUpperCase() : ''}`;
     const q = `encryption=none&security=tls&sni=${encodeURIComponent(WORKER_DOMAIN)}&host=${encodeURIComponent(WORKER_DOMAIN)}&fp=chrome&type=ws&path=${encodeURIComponent(path)}`;
     out.push(`vless://${u.uuid}@${WORKER_DOMAIN}:443?${q}#${encodeURIComponent(remark)}`);
@@ -833,6 +833,47 @@ function workerConfigsForUser(u) {
         return json({ ok: true, user: u });
       }
 
+      // Dedicated Tunnel/Reverse user stores. These never fall back to the
+      // main SPIDER_KV so quotas and authentication remain isolated.
+      const scopedUserApi = async (scopeEnv) => {
+        if (path.endsWith('/users') && request.method === 'POST') {
+          const body = await request.json();
+          const uuid = String(body.uuid || '').toLowerCase();
+          if (!uuidRe().test(uuid)) return json({ error: 'bad uuid' }, 400);
+          const u = {
+            uuid,
+            remark: String(body.remark || 'user'),
+            limit_bytes: Number(body.limit_bytes) || 0,
+            expire: Number(body.expire) || 0,
+            used_bytes: Number(body.used_bytes) || 0,
+            proxy_ip: String(body.proxy_ip || ''),
+            concurrent_connections: Number(body.concurrent_connections) || 0,
+            countries: Array.isArray(body.countries) ? body.countries.map(x => String(x).toLowerCase()).filter(Boolean) : [],
+            created: Date.now(),
+          };
+          u.configs = [];
+          try { await setUser(scopeEnv, uuid, u); }
+          catch (e) { return json({ error: String(e.message || e) }, 503); }
+          return json({ ok: true, user: u });
+        }
+        if (path.includes('/users/') && request.method === 'DELETE') {
+          const uuid = path.split('/').pop().toLowerCase();
+          await scopeEnv.SPIDER_KV.delete('user:' + uuid);
+          return json({ ok: true });
+        }
+        return null;
+      };
+      if (path === '/api/tunnel/users' || path.startsWith('/api/tunnel/users/')) {
+        const tenv = tunnelEnv(env);
+        const out = await scopedUserApi(tenv);
+        if (out) return out;
+      }
+      if (path === '/api/reverse/users' || path.startsWith('/api/reverse/users/')) {
+        const renv = reverseEnv(env);
+        const out = await scopedUserApi(renv);
+        if (out) return out;
+      }
+
       // GET/DELETE /api/user/{uuid}
       if (path.startsWith('/api/user/')) {
         const uuid = path.split('/').pop().toLowerCase();
@@ -868,7 +909,7 @@ function workerConfigsForUser(u) {
     // ── VLESS WS Tunnel ──
     // Supported paths:
     //   /{uuid}            → direct tunnel (user's proxy_ip from KV)
-    //   /route/{code}      → country-based routing (proxy from KV 'proxies' map)
+    //   /route/{country}/{uuid}      → country-based routing (proxy from KV 'proxies' map)
     //   /tunnel/{uuid}     → panel tunnel chain: user → Railway → here → site.
     //                        Authenticated against TUNNEL_KV; direct outbound.
     //   /reverse/{uuid}    → reverse chain: user → here → Railway → site.
@@ -877,12 +918,32 @@ function workerConfigsForUser(u) {
     const seg = path.split('/').filter(Boolean);
     const first = (seg[0] || '').toLowerCase();
 
-    // Route: /route/{code} — multi-location with country proxy lookup
+    // Route: /route/{country}/{uuid} — country pool + authenticated user.
     if (first === 'route' && seg[1]) {
       if (request.headers.get('Upgrade') !== 'websocket') {
         return json({ error: 'websocket upgrade required' }, 400);
       }
-      return handleVlessWs(request, env, seg[1].toLowerCase(), null);
+      const country = String(seg[1] || '').toLowerCase();
+      let uuid = seg[2] ? String(seg[2]).toLowerCase() : '';
+      // Backward-compatible shorthand: /route/tr<uuid>
+      if (!uuid && country.length > 2) {
+        const m = country.match(/^([a-z]{2})([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i);
+        if (m) {
+          uuid = m[2].toLowerCase();
+        }
+      }
+      if (!uuidRe().test(uuid)) return json({ error: 'bad route uuid' }, 400);
+      const normalizedCountry = seg[2] ? country : country.slice(0, 2);
+      const u = await getUser(env, uuid);
+      if (!u) return json({ error: 'unauthorized' }, 403);
+      const assigned = Array.isArray(u.countries) ? u.countries.map(x => String(x).toLowerCase()).filter(Boolean) : [];
+      if (assigned.length && !assigned.includes(normalizedCountry)) {
+        return json({ error: 'country not assigned to user' }, 403);
+      }
+      const loc = await getCountryLocation(env, normalizedCountry);
+      const pool = countryProxyList(loc);
+      if (!pool.length) return json({ error: 'country route has no proxies' }, 404);
+      return handleVlessWs(request, env, normalizedCountry, u);
     }
 
     // Panel tunnel: /tunnel/{uuid} — Railway relays the client's raw VLESS
@@ -893,8 +954,7 @@ function workerConfigsForUser(u) {
         return json({ error: 'websocket upgrade required' }, 400);
       }
       const tenv = tunnelEnv(env);
-      let tu = await getUser(tenv, seg[1]);
-      if (!tu) tu = await getUser(env, seg[1]);
+      const tu = await getUser(tenv, seg[1]);
       if (!tu) return json({ error: 'unauthorized' }, 403);
       return handleTunnelWs(request, tenv, tu, false);
     }
@@ -910,8 +970,7 @@ function workerConfigsForUser(u) {
         return json({ error: 'websocket upgrade required' }, 400);
       }
       const renv = reverseEnv(env);
-      let ru = await getUser(renv, seg[1]);
-      if (!ru) ru = await getUser(env, seg[1]);
+      const ru = await getUser(renv, seg[1]);
       if (!ru) return json({ error: 'unauthorized' }, 403);
       return handleTunnelWs(request, renv, ru, true);
     }
