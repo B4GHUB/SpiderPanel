@@ -83,10 +83,10 @@ https://your-domain.up.railway.app/spider
 📢 کانال‌های ارتباطی
 
 👤 سازنده پروژه:
-amirsp1ider
+B4GHUB
 
-📢 کانال اصلی:
-SPiDER_VPN1
+📢 کانال 
+B4GHUB
 
 ────────
 
